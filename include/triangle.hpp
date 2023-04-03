@@ -30,8 +30,7 @@
 #include <cuda_runtime.h>
 
 template <typename T>
-__align__(48)
-    struct Triangle {
+struct __align__(64) Triangle {
 public:
   vec3<T> v0;
   vec3<T> v1;

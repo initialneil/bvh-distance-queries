@@ -263,7 +263,7 @@ __device__
 
 template <typename T, int StackSize = 32>
 __device__ T traverseBVHStack(const vec3<T> &queryPoint, BVHNodePtr<T> root,
-                              long *closest_face, vec3<T> *closest_bc,
+                              int64_t *closest_face, vec3<T> *closest_bc,
                               vec3<T> *closestPoint) {
   BVHNodePtr<T> stack[StackSize];
   BVHNodePtr<T> *stackPtr = stack;
@@ -333,7 +333,7 @@ __device__ T traverseBVHStack(const vec3<T> &queryPoint, BVHNodePtr<T> root,
 
 template <typename T, int QueueSize = 32>
 __device__ T traverseBVH(const vec3<T> &queryPoint, BVHNodePtr<T> root,
-                         long *closest_face, vec3<T> *closest_bc,
+                         int64_t *closest_face, vec3<T> *closest_bc,
                          vec3<T> *closestPoint) {
   // Create a priority queue
   PriorityQueue<T, BVHNodePtr<T>, QueueSize> queue;
@@ -405,7 +405,7 @@ __device__ T traverseBVH(const vec3<T> &queryPoint, BVHNodePtr<T> root,
 template <typename T, int QueueSize = 32>
 __global__ void findNearestNeighbor(vec3<T> *query_points, T *distances,
                                     vec3<T> *closest_points,
-                                    long *closest_faces,
+                                    int64_t *closest_faces,
                                     vec3<T> *closest_bcs,
                                     BVHNodePtr<T> root, int num_points,
                                     bool use_stack = true) {
@@ -413,7 +413,7 @@ __global__ void findNearestNeighbor(vec3<T> *query_points, T *distances,
        idx += blockDim.x * gridDim.x) {
     vec3<T> query_point = query_points[idx];
 
-    long closest_face;
+    int64_t closest_face;
     vec3<T> closest_bc;
     vec3<T> closest_point;
 
@@ -896,186 +896,189 @@ void bvh_distance_queries_kernel(
   int gridSize = std::min(
       32 * numSMs, static_cast<int>((num_points + blockSize - 1) / blockSize));
 
+  // func
+  auto func = [&] {
+    using scalar_t = float;
+
+#if PRINT_TIMINGS == 1
+    // Create the CUDA events used to estimate the execution time of each
+    // kernel.
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+#endif
+
+    scalar_t *distances_ptr;
+    cudaMalloc((void **)&distances_ptr, num_points * sizeof(scalar_t));
+    cudaCheckError();
+
+    vec3<scalar_t> *morton_sorted_points_ptr;
+    cudaMalloc((void **)&morton_sorted_points_ptr,
+                num_points * sizeof(vec3<scalar_t>));
+    cudaCheckError();
+
+    vec3<scalar_t> *closest_points_ptr;
+    cudaMalloc((void **)&closest_points_ptr,
+                num_points * sizeof(vec3<scalar_t>));
+    cudaCheckError();
+
+    int64_t *closest_faces_ptr;
+    cudaMalloc((void **)&closest_faces_ptr, num_points * sizeof(int64_t));
+    cudaCheckError();
+
+    vec3<scalar_t> *closest_bcs_ptr;
+    cudaMalloc((void **)&closest_bcs_ptr, num_points * sizeof(vec3<scalar_t>));
+    cudaCheckError();
+
+    // The thrust vectors that contain the BVH nodes
+    thrust::device_vector<BVHNode<scalar_t>> leaf_nodes(num_triangles);
+    thrust::device_vector<BVHNode<scalar_t>> internal_nodes(num_triangles -
+                                                            1);
+
+    auto triangle_scalar_t_ptr = triangles.data<scalar_t>();
+
+    for (int bidx = 0; bidx < batch_size; ++bidx) {
+
+      Triangle<scalar_t> *triangles_ptr =
+          (TrianglePtr<scalar_t>)triangle_scalar_t_ptr +
+          num_triangles * bidx;
+
+#if DEBUG_PRINT == 1
+      std::cout << "Start building BVH" << std::endl;
+#endif
+      buildBVH<scalar_t, NUM_THREADS>(
+          internal_nodes.data().get(), leaf_nodes.data().get(),
+          triangles_ptr, &triangle_ids, num_triangles, batch_size);
+#if DEBUG_PRINT == 1
+      std::cout << "Successfully built BVH" << std::endl;
+#endif
+      cudaCheckError();
+
+#if DEBUG_PRINT == 1
+      std::cout << "Start BVH traversal" << std::endl;
+#endif
+      vec3<scalar_t> *points_ptr =
+          (vec3<scalar_t> *)points.data<scalar_t>() + num_points * bidx;
+      thrust::device_vector<int> point_ids(num_points);
+      thrust::sequence(point_ids.begin(), point_ids.end());
+
+      if (sort_points_by_morton) {
+        thrust::device_vector<MortonCode> morton_codes(num_points);
+
+#if PRINT_TIMINGS == 1
+        cudaEventRecord(start);
+#endif
+        ComputePointMortonCodes<scalar_t><<<gridSize, NUM_THREADS>>>(
+            // morton_sorted_points.data().get(), points_ptr, num_points,
+            morton_sorted_points_ptr, points_ptr, num_points,
+            morton_codes.data().get());
+        cudaCheckError();
+        cudaDeviceSynchronize();
+#if PRINT_TIMINGS == 1
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        float milliseconds = 0;
+        cudaEventElapsedTime(&milliseconds, start, stop);
+        std::cout << "Compute morton codes for input points = "
+                  << milliseconds << " (ms)" << std::endl;
+#endif
+
+        thrust::device_ptr<vec3<scalar_t>> dev_ptr =
+            thrust::device_pointer_cast(morton_sorted_points_ptr);
+
+        thrust::sort_by_key(morton_codes.begin(), morton_codes.end(),
+                            thrust::make_zip_iterator(thrust::make_tuple(
+                                point_ids.begin(), dev_ptr)));
+        cudaCheckError();
+
+        points_ptr = morton_sorted_points_ptr;
+      }
+
+#ifdef BVH_PROFILING
+      cudaProfilerStart();
+#endif
+      if (queue_size == 32) {
+        findNearestNeighbor<scalar_t, 32><<<gridSize, NUM_THREADS>>>(
+            points_ptr, distances_ptr, closest_points_ptr,
+            closest_faces_ptr, closest_bcs_ptr,
+            internal_nodes.data().get(), num_points);
+      } else if (queue_size == 64) {
+        findNearestNeighbor<scalar_t, 64><<<gridSize, NUM_THREADS>>>(
+            points_ptr, distances_ptr, closest_points_ptr,
+            closest_faces_ptr, closest_bcs_ptr,
+            internal_nodes.data().get(), num_points);
+      } else if (queue_size == 128) {
+        findNearestNeighbor<scalar_t, 128><<<gridSize, NUM_THREADS>>>(
+            points_ptr, distances_ptr, closest_points_ptr,
+            closest_faces_ptr, closest_bcs_ptr,
+            internal_nodes.data().get(), num_points);
+      } else if (queue_size == 256) {
+        findNearestNeighbor<scalar_t, 256><<<gridSize, NUM_THREADS>>>(
+            points_ptr, distances_ptr, closest_points_ptr,
+            closest_faces_ptr, closest_bcs_ptr,
+            internal_nodes.data().get(), num_points);
+      } else if (queue_size == 512) {
+        findNearestNeighbor<scalar_t, 512><<<gridSize, NUM_THREADS>>>(
+            points_ptr, distances_ptr, closest_points_ptr,
+            closest_faces_ptr, closest_bcs_ptr,
+            internal_nodes.data().get(), num_points);
+      } else if (queue_size == 1024) {
+        findNearestNeighbor<scalar_t, 1024><<<gridSize, NUM_THREADS>>>(
+            points_ptr, distances_ptr, closest_points_ptr,
+            closest_faces_ptr, closest_bcs_ptr,
+            internal_nodes.data().get(), num_points);
+      }
+      cudaCheckError();
+#ifdef BVH_PROFILING
+      cudaProfilerStop();
+#endif
+
+      scalar_t *distances_dest_ptr =
+          (scalar_t *)distances->data<scalar_t>() + num_points * bidx;
+      vec3<scalar_t> *closest_points_dest_ptr =
+          (vec3<scalar_t> *)closest_points->data<scalar_t>() +
+          num_points * bidx;
+      vec3<scalar_t> *closest_bcs_dest_ptr =
+          (vec3<scalar_t> *)closest_bcs->data<scalar_t>() + num_points * bidx;
+      int64_t *closest_faces_dest_ptr =
+          closest_faces->data<int64_t>() + num_points * bidx;
+      if (sort_points_by_morton) {
+        copy_to_tensor<scalar_t>
+            <<<gridSize, NUM_THREADS>>>(distances_dest_ptr, distances_ptr,
+                                        point_ids.data().get(), num_points);
+        copy_to_tensor<vec3<scalar_t>><<<gridSize, NUM_THREADS>>>(
+            closest_points_dest_ptr, closest_points_ptr,
+            point_ids.data().get(), num_points);
+        copy_to_tensor<vec3<scalar_t> ><<<gridSize, NUM_THREADS>>>(
+            closest_bcs_dest_ptr, closest_bcs_ptr,
+            point_ids.data().get(), num_points);
+        copy_to_tensor<int64_t><<<gridSize, NUM_THREADS>>>(
+            closest_faces_dest_ptr, closest_faces_ptr,
+            point_ids.data().get(), num_points);
+      } else {
+        cudaMemcpy(distances_dest_ptr, distances_ptr,
+                    num_points * sizeof(scalar_t), cudaMemcpyDeviceToDevice);
+        cudaMemcpy(closest_points_dest_ptr, closest_points_ptr,
+                    num_points * sizeof(vec3<scalar_t>),
+                    cudaMemcpyDeviceToDevice);
+        cudaMemcpy(closest_bcs_dest_ptr, closest_bcs_ptr,
+                    num_points * sizeof(vec3<scalar_t>), cudaMemcpyDeviceToDevice);
+        cudaMemcpy(closest_faces_dest_ptr, closest_faces_ptr,
+                    num_points * sizeof(int64_t), cudaMemcpyDeviceToDevice);
+      }
+
+#if DEBUG_PRINT == 1
+      std::cout << "Successfully finished BVH traversal" << std::endl;
+#endif
+    }
+    cudaFree(distances_ptr);
+    cudaFree(closest_points_ptr);
+    cudaFree(closest_faces_ptr);
+    cudaFree(closest_bcs_ptr);
+    cudaFree(morton_sorted_points_ptr);
+  };
+
   // Construct the bvh tree
   AT_DISPATCH_FLOATING_TYPES(
-      triangles.type(), "bvh_tree_building", ([&] {
-      // using scalar_t = float;
-
-#if PRINT_TIMINGS == 1
-        // Create the CUDA events used to estimate the execution time of each
-        // kernel.
-        cudaEvent_t start, stop;
-        cudaEventCreate(&start);
-        cudaEventCreate(&stop);
-#endif
-
-        scalar_t *distances_ptr;
-        cudaMalloc((void **)&distances_ptr, num_points * sizeof(scalar_t));
-        cudaCheckError();
-
-        vec3<scalar_t> *morton_sorted_points_ptr;
-        cudaMalloc((void **)&morton_sorted_points_ptr,
-                   num_points * sizeof(vec3<scalar_t>));
-        cudaCheckError();
-
-        vec3<scalar_t> *closest_points_ptr;
-        cudaMalloc((void **)&closest_points_ptr,
-                   num_points * sizeof(vec3<scalar_t>));
-        cudaCheckError();
-
-        long *closest_faces_ptr;
-        cudaMalloc((void **)&closest_faces_ptr, num_points * sizeof(long));
-        cudaCheckError();
-
-        vec3<scalar_t> *closest_bcs_ptr;
-        cudaMalloc((void **)&closest_bcs_ptr, num_points * sizeof(vec3<scalar_t>));
-        cudaCheckError();
-
-        // The thrust vectors that contain the BVH nodes
-        thrust::device_vector<BVHNode<scalar_t>> leaf_nodes(num_triangles);
-        thrust::device_vector<BVHNode<scalar_t>> internal_nodes(num_triangles -
-                                                                1);
-
-        auto triangle_scalar_t_ptr = triangles.data<scalar_t>();
-
-        for (int bidx = 0; bidx < batch_size; ++bidx) {
-
-          Triangle<scalar_t> *triangles_ptr =
-              (TrianglePtr<scalar_t>)triangle_scalar_t_ptr +
-              num_triangles * bidx;
-
-#if DEBUG_PRINT == 1
-          std::cout << "Start building BVH" << std::endl;
-#endif
-          buildBVH<scalar_t, NUM_THREADS>(
-              internal_nodes.data().get(), leaf_nodes.data().get(),
-              triangles_ptr, &triangle_ids, num_triangles, batch_size);
-#if DEBUG_PRINT == 1
-          std::cout << "Successfully built BVH" << std::endl;
-#endif
-          cudaCheckError();
-
-#if DEBUG_PRINT == 1
-          std::cout << "Start BVH traversal" << std::endl;
-#endif
-          vec3<scalar_t> *points_ptr =
-              (vec3<scalar_t> *)points.data<scalar_t>() + num_points * bidx;
-          thrust::device_vector<int> point_ids(num_points);
-          thrust::sequence(point_ids.begin(), point_ids.end());
-
-          if (sort_points_by_morton) {
-            thrust::device_vector<MortonCode> morton_codes(num_points);
-
-#if PRINT_TIMINGS == 1
-            cudaEventRecord(start);
-#endif
-            ComputePointMortonCodes<scalar_t><<<gridSize, NUM_THREADS>>>(
-                // morton_sorted_points.data().get(), points_ptr, num_points,
-                morton_sorted_points_ptr, points_ptr, num_points,
-                morton_codes.data().get());
-            cudaCheckError();
-            cudaDeviceSynchronize();
-#if PRINT_TIMINGS == 1
-            cudaEventRecord(stop);
-            cudaEventSynchronize(stop);
-            float milliseconds = 0;
-            cudaEventElapsedTime(&milliseconds, start, stop);
-            std::cout << "Compute morton codes for input points = "
-                      << milliseconds << " (ms)" << std::endl;
-#endif
-
-            thrust::device_ptr<vec3<scalar_t>> dev_ptr =
-                thrust::device_pointer_cast(morton_sorted_points_ptr);
-
-            thrust::sort_by_key(morton_codes.begin(), morton_codes.end(),
-                                thrust::make_zip_iterator(thrust::make_tuple(
-                                    point_ids.begin(), dev_ptr)));
-            cudaCheckError();
-
-            points_ptr = morton_sorted_points_ptr;
-          }
-
-#ifdef BVH_PROFILING
-          cudaProfilerStart();
-#endif
-          if (queue_size == 32) {
-            findNearestNeighbor<scalar_t, 32><<<gridSize, NUM_THREADS>>>(
-                points_ptr, distances_ptr, closest_points_ptr,
-                closest_faces_ptr, closest_bcs_ptr,
-                internal_nodes.data().get(), num_points);
-          } else if (queue_size == 64) {
-            findNearestNeighbor<scalar_t, 64><<<gridSize, NUM_THREADS>>>(
-                points_ptr, distances_ptr, closest_points_ptr,
-                closest_faces_ptr, closest_bcs_ptr,
-                internal_nodes.data().get(), num_points);
-          } else if (queue_size == 128) {
-            findNearestNeighbor<scalar_t, 128><<<gridSize, NUM_THREADS>>>(
-                points_ptr, distances_ptr, closest_points_ptr,
-                closest_faces_ptr, closest_bcs_ptr,
-                internal_nodes.data().get(), num_points);
-          } else if (queue_size == 256) {
-            findNearestNeighbor<scalar_t, 256><<<gridSize, NUM_THREADS>>>(
-                points_ptr, distances_ptr, closest_points_ptr,
-                closest_faces_ptr, closest_bcs_ptr,
-                internal_nodes.data().get(), num_points);
-          } else if (queue_size == 512) {
-            findNearestNeighbor<scalar_t, 512><<<gridSize, NUM_THREADS>>>(
-                points_ptr, distances_ptr, closest_points_ptr,
-                closest_faces_ptr, closest_bcs_ptr,
-                internal_nodes.data().get(), num_points);
-          } else if (queue_size == 1024) {
-            findNearestNeighbor<scalar_t, 1024><<<gridSize, NUM_THREADS>>>(
-                points_ptr, distances_ptr, closest_points_ptr,
-                closest_faces_ptr, closest_bcs_ptr,
-                internal_nodes.data().get(), num_points);
-          }
-          cudaCheckError();
-#ifdef BVH_PROFILING
-          cudaProfilerStop();
-#endif
-
-          scalar_t *distances_dest_ptr =
-              (scalar_t *)distances->data<scalar_t>() + num_points * bidx;
-          vec3<scalar_t> *closest_points_dest_ptr =
-              (vec3<scalar_t> *)closest_points->data<scalar_t>() +
-              num_points * bidx;
-          vec3<scalar_t> *closest_bcs_dest_ptr =
-              (vec3<scalar_t> *)closest_bcs->data<scalar_t>() + num_points * bidx;
-          long *closest_faces_dest_ptr =
-              closest_faces->data<long>() + num_points * bidx;
-          if (sort_points_by_morton) {
-            copy_to_tensor<scalar_t>
-                <<<gridSize, NUM_THREADS>>>(distances_dest_ptr, distances_ptr,
-                                            point_ids.data().get(), num_points);
-            copy_to_tensor<vec3<scalar_t>><<<gridSize, NUM_THREADS>>>(
-                closest_points_dest_ptr, closest_points_ptr,
-                point_ids.data().get(), num_points);
-            copy_to_tensor<vec3<scalar_t> ><<<gridSize, NUM_THREADS>>>(
-                closest_bcs_dest_ptr, closest_bcs_ptr,
-                point_ids.data().get(), num_points);
-            copy_to_tensor<long><<<gridSize, NUM_THREADS>>>(
-                closest_faces_dest_ptr, closest_faces_ptr,
-                point_ids.data().get(), num_points);
-          } else {
-            cudaMemcpy(distances_dest_ptr, distances_ptr,
-                       num_points * sizeof(scalar_t), cudaMemcpyDeviceToDevice);
-            cudaMemcpy(closest_points_dest_ptr, closest_points_ptr,
-                       num_points * sizeof(vec3<scalar_t>),
-                       cudaMemcpyDeviceToDevice);
-            cudaMemcpy(closest_bcs_dest_ptr, closest_bcs_ptr,
-                       num_points * sizeof(vec3<scalar_t>), cudaMemcpyDeviceToDevice);
-            cudaMemcpy(closest_faces_dest_ptr, closest_faces_ptr,
-                       num_points * sizeof(long), cudaMemcpyDeviceToDevice);
-          }
-
-#if DEBUG_PRINT == 1
-          std::cout << "Successfully finished BVH traversal" << std::endl;
-#endif
-        }
-        cudaFree(distances_ptr);
-        cudaFree(closest_points_ptr);
-        cudaFree(closest_faces_ptr);
-        cudaFree(closest_bcs_ptr);
-        cudaFree(morton_sorted_points_ptr);
-      }));
+      triangles.type(), "bvh_tree_building", func);
 }

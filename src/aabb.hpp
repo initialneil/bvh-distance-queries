@@ -31,8 +31,7 @@
 
 
 template <typename T>
-__align__(32)
-struct AABB {
+struct __align__(32) AABB {
 public:
   __host__ __device__ AABB() {
     min_t.x = std::is_same<T, float>::value ? FLT_MAX : DBL_MAX;
